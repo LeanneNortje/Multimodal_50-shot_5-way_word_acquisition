@@ -248,7 +248,7 @@ args, image_base = modelSetup(command_line_args, True)
 rank = 'cuda'
  
 concepts = []
-with open('./data/test_keywords.txt', 'r') as f:
+with open('./data/40_test_keywords.txt', 'r') as f:
     for keyword in f:
         concepts.append(keyword.strip())
 
@@ -347,7 +347,7 @@ image_model.eval()
 attention.eval()
 contrastive_loss.eval()
 image_base = Path('../Datasets/spokencoco/')
-episodes = np.load(args["episodes_test"], allow_pickle=True)['episodes'].item()
+episodes = np.load(Path('./data/40-way_test_episodes.npz'), allow_pickle=True)['episodes'].item()
 
 with torch.no_grad():
     acc = []
@@ -410,7 +410,6 @@ with torch.no_grad():
                         if w in m_labels[ind]: 
                             results[w]['correct'] += 1
                         results[w]['total'] += 1
-            
             
         c = 0
         t = 0

@@ -75,6 +75,32 @@ scipy_windows = {
     'bartlett': scipy.signal.bartlett
     }
 
+
+def load_concepts():
+    with open('./data/test_keywords.txt', 'r') as f:
+        return [keyword.strip() for keyword in f]
+
+
+def load_alignments(concepts):
+    alignments = {}
+    prev = ''
+    prev_wav = ''
+    prev_start = 0
+    with open(Path('./data/words.txt'), 'r') as f:
+        for line in f:
+            wav, start, stop, label = line.strip().split()
+            if label in concepts or (label == 'hydrant' and prev == 'fire' and wav == prev_wav):
+                if wav not in alignments: alignments[wav] = {}
+                if label == 'hydrant' and prev == 'fire':
+                    label = prev + " " + label
+                    start = prev_start
+                if label not in alignments[wav]: alignments[wav][label] = (int(float(start)*100), int(float(stop)*100))
+            prev = label
+            prev_wav = wav
+            prev_start = start
+    return alignments
+
+
 def myRandomCrop(im, resize, to_tensor):
 
         im = resize(im)
@@ -105,7 +131,7 @@ def LoadAudio(path, alignment, audio_conf):
     hop_length = int(sample_rate * window_stride)
 
     # load audio, subtract DC, preemphasis
-    y, sr = librosa.load(path, sample_rate)
+    y, sr = librosa.load(path, sr=sample_rate)
     dur = librosa.get_duration(y=y, sr=sr)
     nsamples = y.shape[0]
     if y.size == 0:
@@ -118,7 +144,7 @@ def LoadAudio(path, alignment, audio_conf):
         window=scipy_windows.get(window_type, scipy_windows['hamming']))
     spec = np.abs(stft)**2 # Power spectrum
     if audio_type == 'melspectrogram':
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels=num_mel_bins, fmin=fmin)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=num_mel_bins, fmin=fmin)
         melspec = np.dot(mel_basis, spec)
         logspec = librosa.power_to_db(melspec, ref=np.max)
     elif audio_type == 'spectrogram':
@@ -149,6 +175,91 @@ def PadFeat(feat, target_length, padval):
 
     return torch.tensor(feat).unsqueeze(0), torch.tensor(nframes).unsqueeze(0)
 
+def get_detection_metric_count(hyp_trn, gt_trn):
+    # Get the number of true positive (n_tp), true positive + false positive (n_tp_fp) and true positive + false negative (n_tp_fn) for a one sample on the detection task
+    correct_tokens = set([token for token in gt_trn if token in hyp_trn])
+    n_tp = len(correct_tokens)
+    n_tp_fp = len(hyp_trn)
+    n_tp_fn = len(set(gt_trn))
+
+    return n_tp, n_tp_fp, n_tp_fn
+
+def eval_detection_prf(n_tp, n_tp_fp, n_tp_fn):
+    precision = n_tp / n_tp_fp
+    recall = n_tp / n_tp_fn
+    fscore = 2 * precision * recall / (precision + recall)
+
+    return precision, recall, fscore
+
+def eval_detection_accuracy(hyp_loc, gt_loc):
+    score = 0
+    total = 0
+
+    for gt_start_end_frame, gt_token in gt_loc:
+    
+        if gt_token in [hyp_token for _, hyp_token in hyp_loc]:
+            score += 1
+        total += 1
+
+    return score, total
+
+def get_localisation_metric_count(hyp_loc, gt_loc):
+    # Get the number of true positive (n_tp), true positive + false positive (n_tp_fp) and true positive + false negative (n_tp_fn) for a one sample on the localisation task
+    n_tp = 0
+    n_fp = 0
+    n_fn = 0
+
+    for hyp_frame, hyp_token in hyp_loc:
+        if hyp_token not in [gt_token for _, gt_token in gt_loc]:
+            n_fp += 1
+
+    for gt_start_end_frame, gt_token in gt_loc:
+        if gt_token not in [hyp_token for _, hyp_token in hyp_loc]:
+            n_fn += 1
+            continue
+        for hyp_frame, hyp_token in hyp_loc:
+            if hyp_token == gt_token and (gt_start_end_frame[0] <= hyp_frame < gt_start_end_frame[1] or gt_start_end_frame[0] < hyp_frame <= gt_start_end_frame[1]):
+                n_tp += 1
+            elif hyp_token == gt_token and (hyp_frame < gt_start_end_frame[0] or gt_start_end_frame[1] < hyp_frame):
+                n_fp += 1
+
+
+    return n_tp, n_fp, n_fn
+
+def eval_localisation_accuracy(hyp_loc, gt_loc):
+    score = 0
+    total = 0
+
+    for gt_start_end_frame, gt_token in gt_loc:
+        if gt_token not in [hyp_token for _, hyp_token in hyp_loc]:
+            total += 1
+    
+        if gt_token in [hyp_token for _, hyp_token in hyp_loc]:
+            total += 1
+        
+        for hyp_frame, hyp_token in hyp_loc:
+            if hyp_token == gt_token and (gt_start_end_frame[0] <= hyp_frame < gt_start_end_frame[1] or gt_start_end_frame[0] < hyp_frame <= gt_start_end_frame[1]):
+                score += 1
+
+    return score, total
+
+def eval_localisation_prf(n_tp, n_fp, n_fn):
+    precision = n_tp / (n_tp + n_fp)
+    recall = n_tp / (n_tp + n_fn)
+    fscore = 2 * precision * recall / (precision + recall)
+
+    return precision, recall, fscore
+
+def get_gt_token_duration(target_dur, valid_gt_trn):
+            
+    token_dur = []
+    for start_end, dur, tok in target_dur:
+        if tok not in valid_gt_trn:
+            continue
+        token_dur.append((start_end, tok.casefold()))
+    return token_dur
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--resume", action="store_true", dest="resume",
@@ -164,27 +275,8 @@ if __name__ == "__main__":
     args, image_base = modelSetup(command_line_args, True)
     rank = 'cuda'
      
-    concepts = []
-    with open('./data/test_keywords.txt', 'r') as f:
-        for keyword in f:
-            concepts.append(keyword.strip())
-
-    alignments = {}
-    prev = ''
-    prev_wav = ''
-    prev_start = 0
-    with open(Path('../Datasets/spokencoco/SpokenCOCO/words.txt'), 'r') as f:
-        for line in f:
-            wav, start, stop, label = line.strip().split()
-            if label in concepts or (label == 'hydrant' and prev == 'fire' and wav == prev_wav):
-                if wav not in alignments: alignments[wav] = {}
-                if label == 'hydrant' and prev == 'fire': 
-                    label = prev + " " + label
-                    start = prev_start
-                if label not in alignments[wav]: alignments[wav][label] = (int(float(start)*100), int(float(stop)*100))
-            prev = label
-            prev_wav = wav
-            prev_start = start
+    concepts = load_concepts()
+    alignments = load_alignments(concepts)
 
     audio_conf = args["audio_config"]
     target_length = audio_conf.get('target_length', 1024)
@@ -290,7 +382,6 @@ if __name__ == "__main__":
         matching_set_images = torch.cat(matching_set_images, axis=0)
 
         acc = []
-        per_keyword_acc = {}
         for i_test in range(5):
             print(f'\nTest number {i_test+1}-----------------------------------')
             results = {}
@@ -373,18 +464,11 @@ if __name__ == "__main__":
                 t += total
                 percentage = 100*correct/total
                 print(f'{w}: {correct}/{total}={percentage:<.2f}%')
-                if w not in per_keyword_acc: per_keyword_acc[w] = []
-                per_keyword_acc[w].append(percentage)
             percentage = c/t
             print(f'Overall: {c}/{t}={percentage}={100*percentage:<.2f}%')
 
             acc.append(100*percentage)
 
-        
-        for w in per_keyword_acc:
-            avg = np.mean(np.asarray(per_keyword_acc[w]))
-            var = np.std(np.asarray(per_keyword_acc[w]))
-            print(f'Overall {w} mean {avg}% and std {var}%')
         avg = np.mean(np.asarray(acc))
         var = np.std(np.asarray(acc))
         print(f'\nOverall mean {avg}% and std {var}%')

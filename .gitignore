@@ -5,3 +5,4 @@ pretrained_cpc/
 support_set/
 */__pycache__/*
 */__pycache__/*.pyc
+.ipynb_checkpoints/

@@ -59,6 +59,8 @@ flickr_audio_dir = flickr_boundaries_fn.parent / "wavs"
 flickr_images_fn = Path('/storage/Datasets/Flicker8k_Dataset/')
 flickr_segs_fn = Path('./data/flickr_image_masks/')
 
+N = 5
+
 config_library = {
     "multilingual": "English_Hindi_DAVEnet_config.json",
     "multilingual+matchmap": "English_Hindi_matchmap_DAVEnet_config.json",
@@ -149,96 +151,12 @@ def PadFeat(feat, target_length, padval):
 
     return torch.tensor(feat).unsqueeze(0), torch.tensor(nframes).unsqueeze(0)
 
-def get_detection_metric_count(hyp_trn, gt_trn):
-    # Get the number of true positive (n_tp), true positive + false positive (n_tp_fp) and true positive + false negative (n_tp_fn) for a one sample on the detection task
-    correct_tokens = set([token for token in gt_trn if token in hyp_trn])
-    n_tp = len(correct_tokens)
-    n_tp_fp = len(hyp_trn)
-    n_tp_fn = len(set(gt_trn))
-
-    return n_tp, n_tp_fp, n_tp_fn
-
-def eval_detection_prf(n_tp, n_tp_fp, n_tp_fn):
-    precision = n_tp / n_tp_fp
-    recall = n_tp / n_tp_fn
-    fscore = 2 * precision * recall / (precision + recall)
-
-    return precision, recall, fscore
-
-def eval_detection_accuracy(hyp_loc, gt_loc):
-    score = 0
-    total = 0
-
-    for gt_start_end_frame, gt_token in gt_loc:
-    
-        if gt_token in [hyp_token for _, hyp_token in hyp_loc]:
-            score += 1
-        total += 1
-
-    return score, total
-
-def get_localisation_metric_count(hyp_loc, gt_loc):
-    # Get the number of true positive (n_tp), true positive + false positive (n_tp_fp) and true positive + false negative (n_tp_fn) for a one sample on the localisation task
-    n_tp = 0
-    n_fp = 0
-    n_fn = 0
-
-    for hyp_frame, hyp_token in hyp_loc:
-        if hyp_token not in [gt_token for _, gt_token in gt_loc]:
-            n_fp += 1
-
-    for gt_start_end_frame, gt_token in gt_loc:
-        if gt_token not in [hyp_token for _, hyp_token in hyp_loc]:
-            n_fn += 1
-            continue
-        for hyp_frame, hyp_token in hyp_loc:
-            if hyp_token == gt_token and (gt_start_end_frame[0] <= hyp_frame < gt_start_end_frame[1] or gt_start_end_frame[0] < hyp_frame <= gt_start_end_frame[1]):
-                n_tp += 1
-            elif hyp_token == gt_token and (hyp_frame < gt_start_end_frame[0] or gt_start_end_frame[1] < hyp_frame):
-                n_fp += 1
-
-
-    return n_tp, n_fp, n_fn
-
-def eval_localisation_accuracy(hyp_loc, gt_loc):
-    score = 0
-    total = 0
-
-    for gt_start_end_frame, gt_token in gt_loc:
-        if gt_token not in [hyp_token for _, hyp_token in hyp_loc]:
-            total += 1
-    
-        if gt_token in [hyp_token for _, hyp_token in hyp_loc]:
-            total += 1
-        
-        for hyp_frame, hyp_token in hyp_loc:
-            if hyp_token == gt_token and (gt_start_end_frame[0] <= hyp_frame < gt_start_end_frame[1] or gt_start_end_frame[0] < hyp_frame <= gt_start_end_frame[1]):
-                score += 1
-
-    return score, total
-
-def eval_localisation_prf(n_tp, n_fp, n_fn):
-    precision = n_tp / (n_tp + n_fp)
-    recall = n_tp / (n_tp + n_fn)
-    fscore = 2 * precision * recall / (precision + recall)
-
-    return precision, recall, fscore
-
-def get_gt_token_duration(target_dur, valid_gt_trn):
-            
-    token_dur = []
-    for start_end, dur, tok in target_dur:
-        if tok not in valid_gt_trn:
-            continue
-        token_dur.append((start_end, tok.casefold()))
-    return token_dur
-
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("--resume", action="store_true", dest="resume",
         help="load from exp_dir if True")
 parser.add_argument("--config-file", type=str, default='matchmap', choices=['matchmap'], help="Model config file.")
 parser.add_argument("--restore-epoch", type=int, default=-1, help="Epoch to generate accuracies for.")
-parser.add_argument("--image-base", default="..", help="Model config file.")
+parser.add_argument("--image-base", default="/storage", help="Model config file.")
 command_line_args = parser.parse_args()
 restore_epoch = command_line_args.restore_epoch
 
@@ -342,16 +260,29 @@ else:
         rank, False
         )
 
-audio_model.eval()
-image_model.eval()
-attention.eval()
-contrastive_loss.eval()
 image_base = Path('../Datasets/spokencoco/')
 episodes = np.load(args["episodes_test"], allow_pickle=True)['episodes'].item()
 
 with torch.no_grad():
+
+    matching_set_images = []
+    matching_set_labels = []
+    im_used = set()
+    print(len(episodes['matching_set']))
+    for im in tqdm(episodes['matching_set']):
+
+        imgpath = image_base / im
+        this_image = LoadImage(imgpath, resize, image_normalize, to_tensor)
+        this_image_output = image_model(this_image.unsqueeze(0).to(rank))
+        this_image_output = this_image_output.view(this_image_output.size(0), this_image_output.size(1), -1).transpose(1, 2)
+        # this_image_output = this_image_output.mean(dim=1)
+        matching_set_images.append(this_image_output)
+        matching_set_labels.append(episodes['matching_set'][im])
+
+    matching_set_images = torch.cat(matching_set_images, axis=0)
+
     acc = []
-    for i_test in range(1):
+    for i_test in range(5):
         print(f'\nTest number {i_test+1}-----------------------------------')
         results = {}
         cos = nn.CosineSimilarity(dim=1, eps=1e-6)
@@ -362,34 +293,12 @@ with torch.no_grad():
         episode_names = list(episodes.keys())
         episode_names.remove('matching_set')
 
-        # episode_names = np.random.choice(episode_names, 100, replace=False)
+        episode_names = np.random.choice(episode_names, 100, replace=False)
 
-        for episode_num in tqdm(sorted(episode_names)):
+
+        for episode_num in tqdm(episode_names):
 
             episode = episodes[episode_num]
-            
-            m_images = []
-            m_labels = []
-            counting = {}
-
-            for w in episode['matching_set']:
-
-                imgpath = image_base / episode['matching_set'][w]
-                this_image = LoadImage(imgpath, resize, image_normalize, to_tensor)
-                this_image_output = image_model(this_image.unsqueeze(0).to(rank))
-                this_image_output = this_image_output.view(this_image_output.size(0), this_image_output.size(1), -1).transpose(1, 2)
-                # this_image_output = this_image_output.mean(dim=1)
-                m_images.append(this_image_output)
-                m_labels.append(w)
-
-            for w in list(episode['matching_set']):
-                if w not in concepts: continue
-                if w not in counting: counting[w] = 0
-                counting[w] += 1
-                # if counting[w] == 10: break
-
-            m_images = torch.cat(m_images, axis=0)
-    
             for w in episode['queries']:
                 if w not in results: results[w] = {'correct': 0, 'total': 0}
                 wav, spkr = episode['queries'][w]
@@ -400,23 +309,57 @@ with torch.no_grad():
 
                         this_english_audio_feat, this_english_nframes = LoadAudio(image_base / 'SpokenCOCO' / wav, alignments[lookup][w], audio_conf)
                         this_english_audio_feat, this_english_nframes = PadFeat(this_english_audio_feat, target_length, padval)
-                        _, _, query = audio_model(this_english_audio_feat.to(rank))
-                        n_frames = NFrames(this_english_audio_feat, query, this_english_nframes) 
-                        scores = attention.module.one_to_many_score(m_images, query, n_frames).squeeze()
+                        _, _, this_english_output = audio_model(this_english_audio_feat.to(rank))
+                        this_english_nframes = NFrames(this_english_audio_feat, this_english_output, this_english_nframes)  
+                        # this_english_output = this_english_output[:, :, 0:this_english_nframes].mean(dim=-1)
 
-                        # indices = torch.argsort(scores, descending=True)[0: counting[w]]
-                        # for ind in range(counting[w]):
-                        ind = torch.argmax(scores).item()
-                        if w in m_labels[ind]: 
-                            results[w]['correct'] += 1
-                        results[w]['total'] += 1
-            
-            
+                        if w not in queries: queries[w] = []
+                        if w not in query_names: query_names[w] = []
+
+                        if len(queries[w]) < 20 and lookup not in query_names[w]: 
+                            queries[w].append((this_english_output, this_english_nframes))
+                            query_names[w].append(lookup)
+
+        for w in query_names: print(w, len(queries[w]), len(set(query_names[w])))
+                        
         c = 0
-        t = 0
-        for w in results:
-            correct = results[w]['correct']
-            total = results[w]['total']
+        t = 0                            
+        for w in queries:
+            # if w not in ['broccoli', 'zebra', 'kite', 'sheep']: continue
+            correct = 0
+            total = 0
+
+            query = []
+            n_frames = []
+            for q, n_f in queries[w]:
+                query.append(q)
+                n_frames.append(n_f)
+
+            query = torch.cat(query, dim=0)
+            n_frames = torch.cat(n_frames, dim=0)
+            query = torch.mean(query, 0).unsqueeze(0)
+            n_frames = torch.max(n_frames).item()
+
+            scores = attention.module.one_to_many_score(matching_set_images, query, n_frames).squeeze()
+            # scores = torch.zeros((matching_set_images.size(0)))
+            # for m_num in range(matching_set_images.size(0)): 
+            #     scores[m_num] = cos(matching_set_images[m_num, :].unsqueeze(0), query)
+            
+
+
+            indices = torch.argsort(scores, descending=True)[0: N]
+            for ind in range(N):
+                
+                # for c in matching_set_labels[indices[ind]]:
+
+                #     if re.search(w, c) is not None:
+                #         print(ind, scores[indices[ind]])
+                if w in matching_set_labels[indices[ind]]: 
+                    # print(ind)
+                    correct += 1
+                total += 1
+                # if ind == 5: break
+
             c += correct
             t += total
             percentage = 100*correct/total

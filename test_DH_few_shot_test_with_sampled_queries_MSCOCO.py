@@ -260,7 +260,7 @@ if __name__ == "__main__":
             )
 
     image_base = Path('../Datasets/spokencoco/')
-    episodes = np.load(args["episodes_test"], allow_pickle=True)['episodes'].item()
+    episodes = np.load(Path('data/test_episodes_MSCOCO_labels.npz'), allow_pickle=True)['episodes'].item()
 
     with torch.no_grad():
 
